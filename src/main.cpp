@@ -5,6 +5,7 @@
 #include <Geode/Enums.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/PlatformToolbox.hpp>
+#include <Geode/binding/PlayerObject.hpp>
 #include <Geode/binding/UILayer.hpp>
 #include <Geode/binding/StartPosObject.hpp>
 #include <Geode/binding/GameLevelManager.hpp>
@@ -12,12 +13,13 @@
 #include <Geode/loader/Event.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/GJGameLevel.hpp>
 #include <Geode/utils/cocos.hpp>
 #include <Geode/utils/Keyboard.hpp>
 #include "replay.hpp"
+#include "gameplay_copy.hpp"
+#include "trajectory.hpp"
 #include <imgui-cocos.hpp>
 #include <imgui.h>
 #include <fmt/format.h>
@@ -27,9 +29,9 @@
 #include <array>
 #include <chrono>
 #include <deque>
-#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -44,7 +46,6 @@ struct Features {
     bool autoclicker = false;
     bool showFps = false;
     bool showHitboxes = false;
-    bool showBestRun = false;
     bool showClicks = false;
     bool showSessionTime = false;
     bool hidePlayer = false;
@@ -76,7 +77,6 @@ static void loadFeatures() {
     F.autoclicker = mod->getSavedValue<bool>("autoclicker", false);
     F.showFps = mod->getSavedValue<bool>("show_fps", false);
     F.showHitboxes = mod->getSavedValue<bool>("show_hitboxes", false);
-    F.showBestRun = mod->getSavedValue<bool>("show_best_run", false);
     F.showClicks = mod->getSavedValue<bool>("show_clicks", false);
     F.showSessionTime = mod->getSavedValue<bool>("show_session_time", false);
     F.hidePlayer = mod->getSavedValue<bool>("hide_player", false);
@@ -109,7 +109,6 @@ static void saveFeatures() {    auto* mod = Mod::get();
     mod->setSavedValue("autoclicker", F.autoclicker);
     mod->setSavedValue("show_fps", F.showFps);
     mod->setSavedValue("show_hitboxes", F.showHitboxes);
-    mod->setSavedValue("show_best_run", F.showBestRun);
     mod->setSavedValue("show_clicks", F.showClicks);
     mod->setSavedValue("show_session_time", F.showSessionTime);
     mod->setSavedValue("hide_player", F.hidePlayer);
@@ -288,7 +287,7 @@ static void drawMenuSettings(bool& changed) {
 }
 
 static void drawSpeedhack(bool& changed) {
-    changed |= featureRow("Enabled", &F.speedhack);
+    changed |= featureRow("Speedhack", &F.speedhack);
 
     const float fieldWidth = ImGui::CalcTextSize("0.00x").x + ImGui::GetStyle().FramePadding.x * 2.f;
     ImGui::SetNextItemWidth(
@@ -317,25 +316,41 @@ static void drawLocalCopy() {
     auto* play = PlayLayer::get();
     auto* level = play ? play->m_level : nullptr;
     const bool canCopy = level && !level->m_levelString.empty();
+    static bool gameplayOnly = false;
+    static std::string result;
+
     ImGui::BeginDisabled(!canCopy);
     if (ImGui::Button("Copy to My Levels", ImVec2(-FLT_MIN, 0.f))) {
+        gameplayOnly = false;
         ImGui::OpenPopup("Create level copy");
     }
+    if (ImGui::Button("Copy Gameplay Only", ImVec2(-FLT_MIN, 0.f))) {
+        gameplayOnly = true;
+        ImGui::OpenPopup("Create level copy");
+    }
+    ImGui::SetItemTooltip("Save a playable copy with white structures and a black background.");
     ImGui::EndDisabled();
 
-    static std::string result;
     if (ImGui::BeginPopup("Create level copy")) {
-        ImGui::TextUnformatted("Create an editable local copy?");
+        ImGui::TextUnformatted(gameplayOnly ? "Save a gameplay-only copy to My Levels?" : "Create an editable local copy?");
         if (canCopy && ImGui::Button("Create copy")) {
-            auto* levels = GameLevelManager::sharedState();
-            if (auto* copy = levels->createNewLevel()) {
+            auto stripped = gameplayOnly ? makeGameplayCopy(*play) : std::nullopt;
+            if (gameplayOnly && !stripped) {
+                result = "Could not read level objects";
+            } else if (auto* copy = GameLevelManager::sharedState()->createNewLevel()) {
                 copy->copyLevelInfo(level);
-                copy->m_levelName = "Copy of " + level->m_levelName;
+                copy->m_levelName = (gameplayOnly ? "Gameplay of " : "Copy of ") + level->m_levelName;
                 copy->m_password = 0;
                 const int original = level->m_originalLevel.value();
                 copy->m_originalLevel = original != 0 ? original : level->m_levelID.value();
+                if (stripped) {
+                    copy->m_levelString = std::move(stripped->data);
+                    copy->m_objectCount = stripped->objectCount;
+                    copy->m_isVerified = 0;
+                    copy->m_isVerifiedRaw = false;
+                }
                 LocalLevelManager::sharedState()->save(false);
-                result = "Copied to My Levels";
+                result = gameplayOnly ? "Gameplay copy saved" : "Copied to My Levels";
             } else {
                 result = "Could not create a copy";
             }
@@ -351,6 +366,7 @@ static void drawLocalCopy() {
 static void drawGameplay(bool& changed) {
     changed |= featureRow("Auto Clicker", &F.autoclicker);
     changed |= featureRow("Noclip", &F.noclip);
+    drawSpeedhack(changed);
     changed |= featureRow("Safe Mode", &F.safeMode);
     changed |= featureRow("Auto Safe Mode", &F.autoSafeMode);
     if (PlayLayer::get() && safeModeActive()) ImGui::TextDisabled("Progress protected");
@@ -358,13 +374,12 @@ static void drawGameplay(bool& changed) {
     changed |= featureRow("Practice Music", &F.practiceMusic);
     changed |= featureRow("Show Hitboxes", &F.showHitboxes);
     changed |= featureRow("Dual Trajectory (Beta)", &F.trajectory);
-    ImGui::SetItemTooltip("Classic modes: cyan = release, pink = hold. Red marks a possible hazard contact.");
+    ImGui::SetItemTooltip("Classic modes: cyan = release, pink = hold. Red = collision, amber = upcoming interaction.");
     drawLocalCopy();
 }
 
 static void drawLabels(bool& changed) {
     changed |= featureRow("FPS Counter", &F.showFps);
-    changed |= featureRow("Best Run", &F.showBestRun);
     changed |= featureRow("CPS / Attempt Clicks", &F.showClicks);
     changed |= featureRow("Session Time", &F.showSessionTime);
     changed |= featureRow("Noclip Accuracy", &F.accuracy);
@@ -387,6 +402,7 @@ static void drawLabels(bool& changed) {
 }
 
 static void drawReplay(bool&) { replay::draw(); }
+static void drawBestRuns(bool&);
 
 struct MenuPanel {
     const char* title;
@@ -462,7 +478,7 @@ static void drawMenu() {
 
     static MenuPanel panels[] = {
         {"Menu", drawMenuSettings},
-        {"Speedhack", drawSpeedhack},
+        {"Best Runs", drawBestRuns},
         {"Cosmetic", drawCosmetics},
         {"Gameplay", drawGameplay},
         {"Labels", drawLabels},
@@ -540,17 +556,29 @@ class $modify(MyMenuLayer, MenuLayer) {
 
 using StatsClock = std::chrono::steady_clock;
 
+struct BestRun {
+    float from;
+    float best;
+};
+
+struct LevelRuns {
+    std::unordered_map<std::string, BestRun> records;
+    const BestRun* pinned = nullptr;
+};
+
 struct SessionStats {
     double seconds = 0.0;
-    std::unordered_map<std::string, float> bestByLevel;
+    std::unordered_map<std::string, LevelRuns> runsByLevel;
 };
 
 static SessionStats s_sessionStats;
 
 struct AttemptStats {
     Ref<CCLabelBMFont> label;
-    float* best = nullptr;
+    LevelRuns* runs = nullptr;
+    BestRun* best = nullptr;
     StartPosObject* bestStart = nullptr;
+    bool resumedFromCheckpoint = false;
     std::array<bool, 2> held{};
     std::deque<StatsClock::time_point> clicks;
     unsigned totalClicks = 0;
@@ -579,21 +607,95 @@ static std::string bestRunLevelKey(GJGameLevel& level) {
     return fmt::format("local:{}:{}", level.m_levelName, std::hash<std::string>{}(level.m_levelString));
 }
 
-static void updateRunBest(PlayLayer* play, float percent) {
-    if (!play->m_level || !std::isfinite(percent)) return;
+static void selectBestRun(PlayLayer* play) {
+    auto& stats = s_attemptStats;
     auto* start = play->m_startPosObject;
-    if (!s_attemptStats.best || s_attemptStats.bestStart != start) {
-        auto key = bestRunLevelKey(*play->m_level);
-        if (start) {
-            const auto point = start->getPosition();
-            const auto index = play->m_startPosObjects ? play->m_startPosObjects->indexOfObject(start) : 0;
-            key += fmt::format(":start:{}:{:.3f}:{:.3f}", index, point.x, point.y);
-        }
-        s_attemptStats.bestStart = start;
-        s_attemptStats.best = &s_sessionStats.bestByLevel[key];
+    if (!play->m_level || !play->m_player1 || play->m_isPlatformer || stats.resumedFromCheckpoint
+        || (stats.best && stats.bestStart == start)) {
+        return;
     }
-    auto& best = *s_attemptStats.best;
-    best = std::max(best, std::clamp(percent, 0.f, 100.f));
+
+    // Measure progress before physics advances from the spawn point.
+    const float from = start ? play->getCurrentPercent() : 0.f;
+    if (!std::isfinite(from)) return;
+    if (!stats.runs) stats.runs = &s_sessionStats.runsByLevel[bestRunLevelKey(*play->m_level)];
+
+    std::string key;
+    if (start) {
+        const auto point = start->getPosition();
+        const auto index = play->m_startPosObjects ? play->m_startPosObjects->indexOfObject(start) : 0;
+        key = fmt::format("{}:{:.3f}:{:.3f}", index, point.x, point.y);
+    }
+    const float origin = std::clamp(from, 0.f, 100.f);
+    stats.bestStart = start;
+    stats.best = &stats.runs->records.try_emplace(key, BestRun{origin, origin}).first->second;
+}
+
+static void updateRunBest(PlayLayer* play, float percent) {
+    auto& stats = s_attemptStats;
+    if (stats.best && stats.bestStart == play->m_startPosObject && !stats.resumedFromCheckpoint
+        && std::isfinite(percent)) {
+        stats.best->best = std::max(stats.best->best, std::clamp(percent, 0.f, 100.f));
+    }
+}
+
+static void drawBestRuns(bool&) {
+    const auto* play = PlayLayer::get();
+    if (!play) {
+        ImGui::TextWrapped("Play a level to see runs.");
+        return;
+    }
+    if (play->m_isPlatformer) {
+        ImGui::TextWrapped("Classic levels only.");
+        return;
+    }
+
+    const auto& stats = s_attemptStats;
+    if (!stats.runs || stats.runs->records.empty()) {
+        ImGui::TextWrapped("Start an attempt to see runs.");
+        return;
+    }
+
+    const auto& records = stats.runs->records;
+    std::vector<const BestRun*> rows;
+    rows.reserve(records.size());
+    for (const auto& entry : records) rows.push_back(&entry.second);
+    std::sort(rows.begin(), rows.end(), [](const BestRun* a, const BestRun* b) {
+        if (a->from != b->from) return a->from < b->from;
+        return a->best > b->best;
+    });
+
+    constexpr size_t visibleRows = 8;
+    ImGuiTableFlags flags = ImGuiTableFlags_RowBg;
+    float height = 0.f;
+    if (rows.size() > visibleRows) {
+        flags |= ImGuiTableFlags_ScrollY;
+        height = (visibleRows + 1) * (ImGui::GetTextLineHeight() + 2.f * ImGui::GetStyle().CellPadding.y);
+    }
+    if (ImGui::BeginTable("##best-runs", 2, flags, ImVec2(0.f, height))) {
+        ImGui::TableSetupColumn("From");
+        ImGui::TableSetupColumn("Best");
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+        for (const auto* run : rows) {
+            ImGui::TableNextRow();
+            if (run == stats.best && stats.bestStart == play->m_startPosObject) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, ImGui::GetColorU32(ImGuiCol_Header));
+            }
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushID(run);
+            const bool pinned = stats.runs->pinned == run;
+            const auto label = fmt::format("{:.2f}%###run", run->from);
+            if (ImGui::Selectable(label.c_str(), pinned, ImGuiSelectableFlags_SpanAllColumns)) {
+                stats.runs->pinned = pinned ? nullptr : run;
+            }
+            ImGui::SetItemTooltip(pinned ? "Unpin from HUD" : "Pin to HUD");
+            ImGui::PopID();
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.2f%%", run->best);
+        }
+        ImGui::EndTable();
+    }
 }
 
 static void updateSessionStats(PlayLayer* play, float dt) {
@@ -603,11 +705,11 @@ static void updateSessionStats(PlayLayer* play, float dt) {
     }
 
     auto& stats = s_attemptStats;
-    if (!stats.best || stats.bestStart != play->m_startPosObject) updateRunBest(play, 0.f);
+    const auto* pinned = stats.runs ? stats.runs->pinned : nullptr;
     const auto cutoff = StatsClock::now() - std::chrono::seconds(1);
     while (!stats.clicks.empty() && stats.clicks.front() <= cutoff) stats.clicks.pop_front();
 
-    if (!F.showBestRun && !F.showClicks && !F.showSessionTime) {
+    if (!pinned && !F.showClicks && !F.showSessionTime) {
         if (stats.label) stats.label->setVisible(false);
         return;
     }
@@ -622,9 +724,8 @@ static void updateSessionStats(PlayLayer* play, float dt) {
         stats.label = label;
     }
     std::string value;
-    if (F.showBestRun) {
-        value += fmt::format("Best Run{}: {:.2f}%", stats.bestStart ? " (StartPos)" : "",
-            stats.best ? *stats.best : 0.f);
+    if (pinned) {
+        value = fmt::format("Run: {:.2f}% - {:.2f}%", pinned->from, pinned->best);
     }
     if (F.showClicks) {
         if (!value.empty()) value += '\n';
@@ -644,238 +745,6 @@ static void updateSessionStats(PlayLayer* play, float dt) {
     stats.label->setVisible(true);
 }
 
-struct PlayerTrajectory {
-    Ref<CCDrawNode> node;
-    CCPoint lastPosition{};
-    double lastLevelTime = -1.;
-    float dxPerTick = 0.f;
-    std::optional<float> groundY;
-
-    void update(PlayLayer* play, PlayerObject* player) {
-        if (node) node->clear();
-        if (!F.trajectory || !player || !play->m_objectLayer || play->m_isPaused
-            || play->m_hasCompletedLevel || player->m_isDead || play->m_isPlatformer
-            || player->m_isSideways || player->m_isDashing || player->m_isOnSlope) {
-            lastLevelTime = -1.;
-            groundY.reset();
-            return;
-        }
-
-        const auto start = player->getPosition();
-        const double levelTime = play->m_gameState.m_levelTime;
-        const double elapsedTicks = (levelTime - lastLevelTime) * 240.;
-        if (player->m_isOnGround) groundY = start.y;
-        if (lastLevelTime >= 0. && elapsedTicks > 0.0) {
-            dxPerTick = static_cast<float>((start.x - lastPosition.x) / elapsedTicks);
-        }
-        if (lastLevelTime < 0. || elapsedTicks < 0.) dxPerTick = 0.f;
-        lastPosition = start;
-        lastLevelTime = levelTime;
-        if (!(std::abs(dxPerTick) > 0.05f && std::abs(dxPerTick) < 5.f)) return;
-
-        if (!node) {
-            auto* draw = CCDrawNode::create();
-            if (!draw) return;
-            play->m_objectLayer->addChild(draw, 1000);
-            node = draw;
-        }
-
-        const auto shape = player->getObjectRect();
-        const auto offset = shape.origin - start;
-        struct Obstacle {
-            CCRect rect;
-            bool hazard;
-            bool solid;
-        };
-        std::vector<Obstacle> obstacles;
-        const auto& objects = play->m_activeObjects;
-        const auto count = std::min(objects.size(), static_cast<size_t>(std::max(play->m_activeObjectsCount, 0)));
-        const float zoom = std::max(play->m_gameState.m_cameraZoom, 0.1f);
-        const float screenWidth = CCDirector::sharedDirector()->getWinSize().width / zoom;
-        const int ticks = std::clamp(static_cast<int>(std::ceil(screenWidth / std::abs(dxPerTick))), 220, 720);
-        const float endX = start.x + dxPerTick * ticks;
-        for (size_t i = 0; i < count; ++i) {
-            auto* object = objects[i];
-            if (!object || object == play->m_anticheatSpike || object->m_isDisabled || object->m_isDisabled2
-                || object->m_objectType == GameObjectType::Decoration
-                || object->m_objectType == GameObjectType::Collectible
-                || object->m_objectType == GameObjectType::UserCoin
-                || object->m_objectType == GameObjectType::SecretCoin) continue;
-            const auto center = object->getPosition();
-            if (center.x < std::min(start.x, endX) - 100.f || center.x > std::max(start.x, endX) + 100.f) continue;
-            const auto rect = object->getObjectRect();
-            if (rect.size.width > 0.f && rect.size.height > 0.f) {
-                const bool hazard = object->m_objectType == GameObjectType::Hazard
-                    || object->m_objectType == GameObjectType::AnimatedHazard;
-                const bool solid = object->m_objectType == GameObjectType::Solid
-                    || object->m_objectType == GameObjectType::Breakable;
-                if (solid || !shape.intersectsRect(rect)) obstacles.push_back({rect, hazard, solid});
-            }
-        }
-
-        const auto drawBox = [&](CCRect const& rect, float width, ccColor4F color) {
-            const auto lower = rect.origin;
-            const CCPoint right{lower.x + rect.size.width, lower.y};
-            const CCPoint top{right.x, lower.y + rect.size.height};
-            const CCPoint left{lower.x, top.y};
-            node->drawSegment(lower, right, width, color);
-            node->drawSegment(right, top, width, color);
-            node->drawSegment(top, left, width, color);
-            node->drawSegment(left, lower, width, color);
-        };
-
-        const bool mini = player->m_vehicleSize < 0.9f;
-        const float jumpVelocity = mini ? 8.9f : 11.18f;
-        const float gravityMultiplier = std::clamp(std::abs(player->m_gravityMod), 0.05f, 8.f);
-        const float boxSpacing = std::max(5.f, shape.size.width * 0.6f);
-        const auto playerRect = [&](CCPoint position) {
-            return CCRect(position.x + offset.x, position.y + offset.y,
-                shape.size.width, shape.size.height);
-        };
-        const auto heldJump = player->m_holdingButtons.find(static_cast<int>(PlayerButton::Jump));
-        const bool alreadyHeld = heldJump != player->m_holdingButtons.end() && heldJump->second;
-
-        const auto drawBranch = [&](bool held, ccColor4F color, float lineWidth) {
-            auto position = start;
-            auto velocity = static_cast<float>(player->m_yVelocity);
-            float gravityDirection = player->m_isUpsideDown ? 1.f : -1.f;
-            bool grounded = player->m_isOnGround;
-            bool pendingPress = held && !alreadyHeld;
-            int robotBoost = 0;
-            float distanceSinceBox = boxSpacing;
-            auto outline = color;
-            outline.a *= 0.47f;
-
-            for (int tick = 0; tick < ticks; ++tick) {
-                const auto old = position;
-                position.x += dxPerTick;
-                bool teleported = false;
-                if (player->m_isDart) {
-                    position.y += std::abs(dxPerTick) * gravityDirection * (held ? -1.f : 1.f)
-                        * (mini ? 2.f : 1.f);
-                } else {
-                    if ((player->m_isBall || player->m_isSpider) && pendingPress && grounded) {
-                        pendingPress = false;
-                        gravityDirection *= -1.f;
-                        grounded = false;
-                        velocity = 0.f;
-                        if (player->m_isSpider) {
-                            auto rect = playerRect(position);
-                            std::optional<float> nearest;
-                            for (auto const& object : obstacles) {
-                                if (!object.solid || rect.getMaxX() <= object.rect.getMinX()
-                                    || rect.getMinX() >= object.rect.getMaxX()) continue;
-                                const float target = gravityDirection > 0.f
-                                    ? object.rect.getMinY() - offset.y - shape.size.height
-                                    : object.rect.getMaxY() - offset.y;
-                                const float distance = (target - position.y) * gravityDirection;
-                                if (distance > 0.f && (!nearest || distance < *nearest)) nearest = distance;
-                            }
-                            if (!nearest) break;
-                            position.y += *nearest * gravityDirection;
-                            grounded = true;
-                            teleported = true;
-                        }
-                    } else if (player->m_isSwing && pendingPress) {
-                        pendingPress = false;
-                        gravityDirection *= -1.f;
-                        grounded = false;
-                    } else if ((player->m_isBird && pendingPress)
-                        || (held && grounded && !player->m_isShip && !player->m_isSwing
-                            && !player->m_isBall && !player->m_isSpider && !player->m_isBird)) {
-                        pendingPress = false;
-                        velocity = -gravityDirection * (player->m_isBird ? 8.5f : jumpVelocity);
-                        grounded = false;
-                        if (player->m_isRobot) robotBoost = 30;
-                    }
-
-                    if (player->m_isShip && held) grounded = false;
-                    if (!grounded) {
-                        position.y += velocity * 0.225f;
-                        float acceleration = 0.212f * gravityDirection;
-                        if (player->m_isShip) acceleration = (held ? -0.33f : 0.25f) * gravityDirection;
-                        if (player->m_isSwing) acceleration = 0.30f * gravityDirection;
-                        if (held && robotBoost > 0) {
-                            acceleration *= 0.32f;
-                            --robotBoost;
-                        }
-                        velocity += acceleration * gravityMultiplier;
-                        if (player->m_isShip || player->m_isSwing) velocity = std::clamp(velocity, -10.f, 10.f);
-                        if (groundY && gravityDirection == (player->m_isUpsideDown ? 1.f : -1.f)
-                            && (position.y - *groundY) * gravityDirection >= 0.f
-                            && velocity * gravityDirection >= 0.f) {
-                            position.y = *groundY;
-                            velocity = 0.f;
-                            grounded = true;
-                        }
-                    }
-                }
-
-                // Continue from a solid surface when the projected box crosses its top
-                // (or underside under inverted gravity). Side contacts still end the branch.
-                if (!player->m_isDart && !teleported && velocity * gravityDirection >= 0.f) {
-                    const auto before = playerRect(old);
-                    const auto after = playerRect(position);
-                    std::optional<float> landing;
-                    for (auto const& object : obstacles) {
-                        if (!object.solid || after.getMaxX() <= object.rect.getMinX()
-                            || after.getMinX() >= object.rect.getMaxX()) continue;
-                        const float surface = gravityDirection < 0.f ? object.rect.getMaxY() : object.rect.getMinY();
-                        const float previousEdge = gravityDirection < 0.f ? before.getMinY() : before.getMaxY();
-                        const float nextEdge = gravityDirection < 0.f ? after.getMinY() : after.getMaxY();
-                        if ((previousEdge - surface) * gravityDirection > 0.05f
-                            || (nextEdge - surface) * gravityDirection < 0.f) continue;
-                        const float y = surface - offset.y - (gravityDirection > 0.f ? shape.size.height : 0.f);
-                        if (!landing || (y - *landing) * gravityDirection < 0.f) landing = y;
-                    }
-                    if (landing) {
-                        position.y = *landing;
-                        velocity = 0.f;
-                        grounded = true;
-                    } else if (grounded && (!groundY || std::abs(position.y - *groundY) > 0.05f)) {
-                        grounded = false;
-                    }
-                }
-                if (!teleported) node->drawSegment(old, position, lineWidth, color);
-                const auto rect = playerRect(position);
-                const auto contact = std::find_if(obstacles.begin(), obstacles.end(),
-                    [&](Obstacle const& object) {
-                        // A shared floor edge is not an overlap.
-                        return rect.getMaxX() > object.rect.getMinX() + 0.05f
-                            && rect.getMinX() < object.rect.getMaxX() - 0.05f
-                            && rect.getMaxY() > object.rect.getMinY() + 0.05f
-                            && rect.getMinY() < object.rect.getMaxY() - 0.05f;
-                    });
-                if (contact != obstacles.end()) {
-                    const ccColor4F contactColor = contact->hazard
-                        ? ccColor4F{1.f, 0.25f, 0.18f, 1.f}
-                        : ccColor4F{1.f, 0.78f, 0.25f, 0.95f};
-                    drawBox(rect, 0.60f / zoom, contactColor);
-                    if (contact->hazard) drawBox(contact->rect, 0.50f / zoom, contactColor);
-                    break;
-                }
-
-                distanceSinceBox += std::hypot(position.x - old.x, position.y - old.y);
-                if (distanceSinceBox >= boxSpacing || tick + 1 == ticks) {
-                    drawBox(rect, 0.25f / zoom, outline);
-                    distanceSinceBox = 0.f;
-                }
-            }
-        };
-
-        drawBranch(false, {0.15f, 0.9f, 1.f, 0.85f}, 0.36f);
-        drawBranch(true, {1.f, 0.25f, 0.65f, 0.95f}, 0.27f);
-    }
-
-    void clear() {
-        if (node) node->clear();
-        lastLevelTime = -1.;
-        groundY.reset();
-    }
-};
-
-static std::array<PlayerTrajectory, 2> s_trajectories;
-
 class $modify(SafeModeGameLevel, GJGameLevel) {
     void savePercentage(int percent, bool practice, int clicks, int attempts, bool valid) {
         const auto* play = PlayLayer::get();
@@ -892,7 +761,7 @@ class $modify(GdMenuPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool dontCreateObjects) {
         s_autoSafeAttempt = false;
         s_attemptStats = {};
-        s_trajectories = {};
+        trajectory::reset();
         return PlayLayer::init(level, dontCreateObjects);
     }
 
@@ -901,9 +770,10 @@ class $modify(GdMenuPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (showNoclipStats() && object && player && m_started && !m_isPaused
-            && object != m_anticheatSpike) {
-            if (s_accHitObjects.insert(object).second) {
+        if (trajectory::interceptDeath(this)) return;
+        if (object && player && m_started && !m_isPaused && object != m_anticheatSpike) {
+            updateRunBest(this, getCurrentPercent());
+            if (showNoclipStats() && s_accHitObjects.insert(object).second) {
                 s_accBadFrame = true;
                 s_accDeaths++;
                 doFlash();
@@ -926,17 +796,22 @@ class $modify(GdMenuPlayLayer, PlayLayer) {
 
     void resetLevel() {
         s_attemptStats.resetClicks();
-        for (auto& trajectory : s_trajectories) trajectory.clear();
+        s_attemptStats.resumedFromCheckpoint = false;
+        trajectory::clear();
         if (s_accOwner == this) resetAccuracy();
         PlayLayer::resetLevel();
         s_autoSafeAttempt = autoSafeRequired();
-        s_attemptStats.best = nullptr;
+    }
+
+    void loadFromCheckpoint(CheckpointObject* checkpoint) {
+        if (checkpoint) s_attemptStats.resumedFromCheckpoint = true;
+        PlayLayer::loadFromCheckpoint(checkpoint);
     }
 
     void onQuit() {
         s_protectedQuitLevel = safeModeActive() ? m_level : nullptr;
         s_attemptStats = {};
-        s_trajectories = {};
+        trajectory::reset();
         s_inLevel = false;
         s_levelLayer = nullptr;
         s_pausedLevel = false;
@@ -968,6 +843,7 @@ class $modify(GJBaseGameLayer) {
         }
 
         if (pl && autoSafeRequired()) s_autoSafeAttempt = true;
+        if (pl && dt > 0.f && !pl->m_isPaused && !pl->m_hasCompletedLevel) selectBestRun(pl);
         GJBaseGameLayer::update(dt * speed);
         if (pl && F.showHitboxes) {
             m_isDebugDrawEnabled = nativeDebugDraw;
@@ -979,8 +855,7 @@ class $modify(GJBaseGameLayer) {
             s_levelLayer = pl;
             this->updateAccuracy(pl);
             updateSessionStats(pl, dt);
-            s_trajectories[0].update(pl, pl->m_player1);
-            s_trajectories[1].update(pl, pl->m_gameState.m_isDualMode ? pl->m_player2 : nullptr);
+            trajectory::update(pl, F.trajectory);
         }
 
         if (!F.autoclicker || replay::active()) {
